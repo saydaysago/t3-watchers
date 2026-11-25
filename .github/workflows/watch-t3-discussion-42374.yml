@@ -1,0 +1,43 @@
+# Wakes one T3 Code thread, once, when a T3 maintainer replies on
+# https://github.com/pingdotgg/t3code/discussions/42374
+# No model runs here. After a successful wake-up, the workflow disables itself.
+name: Watch T3 discussion 42374
+
+on:
+  schedule:
+    - cron: "17 */4 * * *"
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: Check only; never call the webhook
+        type: boolean
+        default: true
+
+permissions:
+  actions: write
+  contents: read
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check for a maintainer reply and wake the thread once
+        env:
+          GH_TOKEN: ${{ github.token }}
+          HMAC: ${{ secrets.T3_WATCH_HMAC }}
+          WEBHOOK_URL: ${{ secrets.T3_WATCH_WEBHOOK_URL }}
+          DRY_RUN: ${{ inputs.dry_run || 'false' }}
+        run: |
+          set -euo pipefail
+          n=$(gh api graphql -F o=pingdotgg -F r=t3code -F d=42374 \
+            -f query='query($o:String!,$r:String!,$d:Int!){repository(owner:$o,name:$r){discussion(number:$d){comments(last:50){nodes{authorAssociation replies(last:50){nodes{authorAssociation}}}}}}}' \
+            --jq '[.data.repository.discussion.comments.nodes[] | (., .replies.nodes[]) | select(.authorAssociation=="OWNER" or .authorAssociation=="MEMBER" or .authorAssociation=="COLLABORATOR")] | length')
+          echo "maintainer replies: $n"
+          [ "$n" -gt 0 ] || exit 0
+          if [ "$DRY_RUN" = "true" ]; then echo "dry run: would wake the thread now"; exit 0; fi
+          body='{"event":"maintainer_reply","discussion":42374}'
+          sig=$(printf '%s' "$body" | openssl dgst -sha256 -hmac "$HMAC" | awk '{print $NF}')
+          curl -fsS -X POST -H 'Content-Type: application/json' -H "X-Signature-256: sha256=$sig" \
+            --data "$body" "$WEBHOOK_URL" -o /dev/null -w 'webhook status: %{http_code}\n'
+          gh workflow disable "$GITHUB_WORKFLOW" -R "$GITHUB_REPOSITORY"
+          echo "thread woken; workflow disabled"
